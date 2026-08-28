@@ -1,0 +1,7 @@
+out/
+.build/
+*.iso
+*.qcow2
+*.ppm
+__pycache__/
+*.pyc

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -u
+
+action="${1:-}"
+if [ -z "$action" ]; then
+  action=$(printf 'Install\nRemove' | fuzzel --dmenu --prompt "  ")
+fi
+[ -z "$action" ] && exit 0
+
+case "$action" in
+  Install) list=$(pacman -Slq); verb=(pacman -S --needed) ;;
+  Remove)  list=$(pacman -Qq);  verb=(pacman -Rns) ;;
+  *) exit 0 ;;
+esac
+
+pkg=$(printf '%s\n' "$list" | fuzzel --dmenu --prompt "  $action ")
+[ -z "$pkg" ] && exit 0
+
+kitty --class flux-overlay -e flux-overlay sudo "${verb[@]}" "$pkg"

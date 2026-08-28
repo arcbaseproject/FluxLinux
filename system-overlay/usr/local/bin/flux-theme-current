@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Print the display name of the currently applied theme.
+set -euo pipefail
+
+NAME_FILE="$HOME/.local/state/fluxlinux/current-theme.name"
+name=$(cat "$NAME_FILE" 2>/dev/null || echo "")
+[[ -n "$name" ]] || { echo "Unknown"; exit 0; }
+
+for dir in "$HOME/.config/fluxlinux/themes" /usr/share/fluxlinux/themes; do
+  if [[ -f "$dir/$name/colors.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$dir/$name/colors.sh"
+    echo "${LABEL:-$name}"
+    exit 0
+  fi
+done
+
+echo "$name"

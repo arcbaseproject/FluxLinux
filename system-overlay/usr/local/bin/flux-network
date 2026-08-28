@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+fallback='{"label":"Disconnected","type":"none"}'
+
+iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+[ -z "$iface" ] && { printf '%s\n' "$fallback"; exit 0; }
+
+gateway=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+ip_addr=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+
+if [ -d "/sys/class/net/$iface/wireless" ]; then
+  type="wifi"
+  label="Wi-Fi"
+else
+  type="ethernet"
+  speed=$(cat "/sys/class/net/$iface/speed" 2>/dev/null)
+  if [ -n "$speed" ] && [ "$speed" -ge 1000 ] 2>/dev/null; then
+    label="Ethernet (${speed}mbit)"
+    if [ $((speed % 1000)) -eq 0 ]; then label="Ethernet ($((speed / 1000))gbit)"; fi
+  elif [ -n "$speed" ]; then
+    label="Ethernet (${speed}mbit)"
+  else
+    label="Ethernet"
+  fi
+fi
+
+human() {
+  awk -v b="$1" 'BEGIN {
+    split("B KB MB GB TB", u, " ");
+    i = 1;
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf "%.1f %s", b, u[i]
+  }'
+}
+
+rx1=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0)
+tx1=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)
+sleep 0.3
+rx2=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null || echo 0)
+tx2=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null || echo 0)
+
+rx_rate=$(human "$(awk -v a="$rx1" -v b="$rx2" 'BEGIN{print (b-a)/0.3}')")/s
+tx_rate=$(human "$(awk -v a="$tx1" -v b="$tx2" 'BEGIN{print (b-a)/0.3}')")/s
+rx_total=$(human "$rx2")
+tx_total=$(human "$tx2")
+
+ping_out=$(ping -c1 -W1 1.1.1.1 2>/dev/null)
+ping_ms=$(printf '%s' "$ping_out" | grep -oP '(?<=time=)[\d.]+' | head -1)
+loss_pct=$(printf '%s' "$ping_out" | grep -oP '\d+(?=% packet loss)' | head -1)
+[ -z "$ping_ms" ] && ping_ms="--"
+[ -z "$loss_pct" ] && loss_pct="100"
+
+con=$(nmcli -t -g GENERAL.CONNECTION device show "$iface" 2>/dev/null)
+dns_provider="dhcp"
+if [ -n "$con" ] && [ "$con" != "--" ]; then
+  auto_dns=$(nmcli -g ipv4.ignore-auto-dns con show "$con" 2>/dev/null)
+  dns_servers=$(nmcli -g ipv4.dns con show "$con" 2>/dev/null)
+  if [ "$auto_dns" = "yes" ]; then
+    case "$dns_servers" in
+      *1.1.1.1*) dns_provider="cloudflare" ;;
+      *8.8.8.8*) dns_provider="google" ;;
+      *) dns_provider="custom" ;;
+    esac
+  fi
+fi
+
+jq -nc \
+  --arg iface "$iface" --arg type "$type" --arg label "$label" \
+  --arg ping_ms "$ping_ms" --arg loss_pct "$loss_pct" \
+  --arg rx_rate "$rx_rate" --arg tx_rate "$tx_rate" \
+  --arg rx_total "$rx_total" --arg tx_total "$tx_total" \
+  --arg ip "$ip_addr" --arg gateway "$gateway" \
+  --arg con "$con" --arg dns "$dns_provider" --arg dns_servers "$dns_servers" \
+  '{iface:$iface, type:$type, label:$label, ping_ms:$ping_ms, loss_pct:$loss_pct,
+    rx_rate:$rx_rate, tx_rate:$tx_rate, rx_total:$rx_total, tx_total:$tx_total,
+    ip:$ip, gateway:$gateway, connection:$con, dns:$dns, dns_servers:$dns_servers}'

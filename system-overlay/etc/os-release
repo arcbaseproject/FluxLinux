@@ -1,0 +1,11 @@
+NAME="FluxLinux"
+PRETTY_NAME="FluxLinux"
+ID=fluxlinux
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;80;220;180"
+HOME_URL="https://fluxlinux.xyz/"
+DOCUMENTATION_URL="https://fluxlinux.xyz/docs"
+SUPPORT_URL="https://fluxlinux.xyz/contact"
+BUG_REPORT_URL="LOGO=fluxlinux"
+LOGO=fluxlinux

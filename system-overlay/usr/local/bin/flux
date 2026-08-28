@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import os
+import platform
+import subprocess
+import sys
+
+VERSION = "0.1"
+
+def sh(*args):
+    return subprocess.call(args)
+
+def info():
+    print(f"FluxLinux {VERSION}")
+    print(f"Kernel: {platform.release()}")
+    print(f"Host:   {platform.node()}")
+    print(f"Python: {platform.python_version()}")
+
+def help_():
+    print("""FluxLinux command
+
+Usage:
+  flux info       Show system information
+  flux update     Update the system
+  flux doctor     Run basic health checks
+  flux config     Open ~/.config
+""")
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+    if cmd == "info": info()
+    elif cmd == "update": return sh("flux-update")
+    elif cmd == "doctor": return sh("flux-doctor")
+    elif cmd == "config": return sh(os.environ.get("FILE_MANAGER", "thunar"), os.path.expanduser("~/.config"))
+    else: help_()
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

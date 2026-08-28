@@ -1,0 +1,21 @@
+[Unit]
+Description=FluxLinux TUI Installer
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service
+Before=getty@tty1.service
+
+[Service]
+Type=simple
+# Fall through to a normal login prompt however flux-install exits (Esc,
+# "Exit installer", or a crash) so tty1 never just goes dead.
+ExecStart=/bin/sh -c '/usr/local/bin/flux-install; exec /usr/bin/agetty --noreset --noclear - "$TERM"'
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

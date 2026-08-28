@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Floating terminal overlay that keeps command output open until acknowledged.
+# Usage: flux-overlay <command> [args...]
+set -u
+
+"$@"
+status=$?
+
+echo
+read -rsn1 -p "Press any key to close..."
+exit "$status"

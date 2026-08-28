@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -u
+STATE="$HOME/.local/state/fluxlinux/nightlight.on"
+mkdir -p "$(dirname "$STATE")"
+
+if [[ -f "$STATE" ]]; then
+  hyprctl hyprsunset identity && rm -f "$STATE"
+else
+  hyprctl hyprsunset temperature 4000 && touch "$STATE"
+fi

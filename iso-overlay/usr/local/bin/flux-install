@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""FluxLinux curses installer UI.
+
+This front-end intentionally delegates destructive work to flux-install-core.
+It requires an explicit ERASE confirmation before a disk can be modified.
+"""
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+BRAND = "FluxLinux"
+VERSION = "0.1"
+BOOTLOADERS = ["systemd-boot", "grub", "limine"]
+FALLBACK_TIMEZONES = ["UTC", "America/New_York", "America/Chicago", "Europe/London", "Asia/Tokyo"]
+WORDMARK = [
+    "█████ █     █   █ █   █   █     █ █   █ █   █ █   █",
+    "█     █     █   █  █ █    █     ██  █ █   █ █   █ █",
+    "████  █     █   █   █     █     █ █ █ █   █  █ █  █",
+    "█     █     █   █  █ █    █     █  ██ █   █   █   █",
+    "█     █████ █████ █   █   █████ █   █ █████   █   █",
+]
+
+
+def run(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True, check=False)
+
+
+def disks():
+    p = run(["lsblk", "-J", "-d", "-o", "PATH,SIZE,MODEL,TYPE"])
+    out = []
+    try:
+        devices = json.loads(p.stdout).get("blockdevices", [])
+    except json.JSONDecodeError:
+        return out
+    for dev in devices:
+        name = dev.get("path") or ""
+        if dev.get("type") != "disk":
+            continue
+        if name.startswith(("/dev/loop", "/dev/sr", "/dev/zram")):
+            continue
+        out.append((name, dev.get("size") or "?", (dev.get("model") or "Disk").strip()))
+    return out
+
+
+def detect_timezone():
+    p = run(["timedatectl", "show", "-p", "Timezone", "--value"])
+    return p.stdout.strip() or "UTC"
+
+
+@dataclass
+class State:
+    disk: str = ""
+    install_mode: str = "erase"
+    hostname: str = "flux"
+    username: str = "flux"
+    timezone: str = "UTC"
+    filesystem: str = "btrfs"
+    encrypt: bool = False
+    bootloader: str = "systemd-boot"
+
+
+class UI:
+    def __init__(self, stdscr):
+        self.s = stdscr
+        self.state = State(timezone=detect_timezone())
+        curses.curs_set(0)
+        self.s.keypad(True)
+        curses.use_default_colors()
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
+            curses.init_pair(5, curses.COLOR_CYAN, -1)
+
+    def center(self, y, text, attr=0):
+        h, w = self.s.getmaxyx()
+        x = max(0, (w - len(text)) // 2)
+        try:
+            self.s.addstr(y, x, text[: max(0, w-1-x)], attr)
+        except curses.error:
+            pass
+
+    def wordmark(self, start=1):
+        h, w = self.s.getmaxyx()
+        if h < start + len(WORDMARK) or w < max(map(len, WORDMARK)) + 2:
+            self.center(start, BRAND.upper(), curses.color_pair(1) | curses.A_BOLD)
+            return start + 2
+        for y, line in enumerate(WORDMARK, start):
+            self.center(y, line, curses.color_pair(1) | curses.A_BOLD)
+        return start + len(WORDMARK) + 1
+
+    def splash(self):
+        self.s.erase()
+        h, w = self.s.getmaxyx()
+        y = self.wordmark(max(1, h // 2 - 6))
+        self.center(y, f"Installer {VERSION}", curses.color_pair(5) | curses.A_BOLD)
+        self.center(y + 2, "A minimal, modern Hyprland desktop.", curses.A_DIM)
+        self.center(h - 2, "Press any key to begin", curses.color_pair(1) | curses.A_BOLD)
+        self.s.refresh()
+        self.s.getch()
+
+    def frame(self, subtitle="", branded=True):
+        self.s.erase()
+        h, w = self.s.getmaxyx()
+        top = self.wordmark(1) if branded and h >= 22 else 1
+        if subtitle:
+            self.center(top, subtitle, curses.color_pair(5) | curses.A_BOLD)
+            top += 2
+        self.center(h - 2, "↑↓ move  •  enter select  •  esc back", curses.A_DIM)
+        self.content_top = top
+        self.s.refresh()
+
+    def menu(self, subtitle, items, selected=0, body=()):
+        width = min(max(48, max(map(len, items)) + 4), 76)
+        while True:
+            h, w = self.s.getmaxyx()
+            self.frame(subtitle, branded=h >= len(body) + len(items) + 14)
+            start = self.content_top
+            if body:
+                body_width = min(max(map(len, body)), w - 6)
+                left = max(2, (w - body_width) // 2)
+                for line in body:
+                    try:
+                        self.s.addstr(start, left, line[:body_width])
+                    except curses.error:
+                        pass
+                    start += 1
+                start += 1
+            rows = max(1, h - start - 3)
+            if len(items) <= rows:
+                offset, count = 0, len(items)
+                if not body:
+                    start += max(0, (rows - count) // 2)
+            else:
+                count = rows
+                offset = max(0, min(selected - count//2, len(items)-count))
+                self.center(start - 1, f"{selected + 1} / {len(items)}", curses.A_DIM)
+            for row in range(count):
+                idx = offset+row
+                attr = curses.color_pair(2) | curses.A_BOLD if idx == selected else 0
+                marker = "›" if idx == selected else " "
+                line = f" {marker} {items[idx]}".ljust(width)
+                self.center(start+row, line, attr)
+            self.s.refresh()
+            k = self.s.getch()
+            if k in (curses.KEY_UP, ord('k')):
+                selected = (selected - 1) % len(items)
+            elif k in (curses.KEY_DOWN, ord('j')):
+                selected = (selected + 1) % len(items)
+            elif k in (10, 13, curses.KEY_ENTER):
+                return selected
+            elif k == 27:
+                return None
+
+    def text_input(self, label, default="", secret=False):
+        self.frame(label)
+        h, w = self.s.getmaxyx()
+        box_width = min(56, w - 6)
+        x = max(2, (w - box_width) // 2)
+        y = max(self.content_top + 2, h // 2)
+        try:
+            self.s.addstr(y - 1, x, "┌" + "─" * (box_width - 2) + "┐", curses.color_pair(1))
+            self.s.addstr(y, x, "│", curses.color_pair(1))
+            self.s.addstr(y, x + box_width - 1, "│", curses.color_pair(1))
+            self.s.addstr(y + 1, x, "└" + "─" * (box_width - 2) + "┘", curses.color_pair(1))
+        except curses.error:
+            pass
+        curses.curs_set(1)
+        curses.noecho()
+        value = list(default)
+        while True:
+            shown = "*" * len(value) if secret else "".join(value)
+            try:
+                self.s.addstr(y, x + 2, " " * (box_width - 4))
+                self.s.addstr(y, x + 2, shown[:box_width - 4], curses.A_BOLD)
+                self.s.move(y, x + 2 + min(len(shown), box_width - 4))
+            except curses.error:
+                pass
+            self.s.refresh()
+            k = self.s.getch()
+            if k in (10, 13, curses.KEY_ENTER):
+                curses.curs_set(0)
+                return "".join(value)
+            if k == 27:
+                curses.curs_set(0)
+                return None
+            if k in (curses.KEY_BACKSPACE, 127, 8):
+                if value: value.pop()
+            elif 32 <= k <= 126:
+                value.append(chr(k))
+
+    def message(self, title, lines, color=0):
+        self.frame(title)
+        h, w = self.s.getmaxyx()
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        box_width = min(max(map(len, lines)) + 6, w - 6)
+        y = max(self.content_top + 1, (h - len(lines)) // 2)
+        left = max(2, (w - box_width) // 2)
+        try:
+            self.s.addstr(y, left, "┌" + "─" * (box_width - 2) + "┐", color)
+            for row, line in enumerate(lines, y + 1):
+                self.s.addstr(row, left, "│ " + line.ljust(box_width - 4) + " │", color)
+            y += len(lines) + 1
+            self.s.addstr(y, left, "└" + "─" * (box_width - 2) + "┘", color)
+        except curses.error:
+            pass
+        self.center(min(h - 3, y + 2), "Press any key to continue", curses.A_DIM)
+        self.s.refresh()
+        self.s.getch()
+
+    def choose_disk(self):
+        ds = disks()
+        if not ds:
+            self.message("No disks found", "No installable block devices were detected.", curses.color_pair(4))
+            return
+        labels = [f"{n}  {size:>8}  {model}" for n,size,model in ds]
+        i = self.menu("Choose installation disk", labels)
+        if i is not None:
+            self.state.disk = ds[i][0]
+
+    def choose_timezone(self):
+        s = self.state
+        p = run(["timedatectl", "list-timezones"])
+        items = [l for l in p.stdout.splitlines() if l.strip()] or FALLBACK_TIMEZONES
+        default = items.index(s.timezone) if s.timezone in items else 0
+        i = self.menu("Timezone", items, default)
+        if i is not None:
+            s.timezone = items[i]
+
+    def configure(self):
+        while True:
+            s = self.state
+            rows = [
+                f"Disk          │ {s.disk or 'Not selected'}",
+                f"Install mode  │ {'Erase disk' if s.install_mode == 'erase' else 'Dual boot · free space'}",
+                f"Hostname      │ {s.hostname}",
+                f"Username      │ {s.username}",
+                f"Timezone      │ {s.timezone}",
+                f"Filesystem    │ {s.filesystem}",
+                f"Encryption    │ {'LUKS2' if s.encrypt else 'Off'}",
+                f"Bootloader    │ {s.bootloader}",
+                "Install FluxLinux  →",
+                "Exit installer",
+            ]
+            i = self.menu("Configure your installation", rows)
+            if i is None or i == 9:
+                return
+            if i == 0:
+                self.choose_disk()
+            elif i == 1:
+                j = self.menu("Install mode", ["Erase disk (clean install)", "Use unallocated space (dual boot)"], 0 if s.install_mode == "erase" else 1)
+                if j is not None: s.install_mode = "erase" if j == 0 else "alongside"
+            elif i == 2:
+                v = self.text_input("Hostname", s.hostname)
+                if v and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}", v): s.hostname = v
+            elif i == 3:
+                v = self.text_input("Username", s.username)
+                if v and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", v): s.username = v
+            elif i == 4:
+                self.choose_timezone()
+            elif i == 5:
+                j = self.menu("Filesystem", ["btrfs (recommended)", "ext4"], 0 if s.filesystem == "btrfs" else 1)
+                if j is not None: s.filesystem = "btrfs" if j == 0 else "ext4"
+            elif i == 6:
+                j = self.menu("Disk encryption", ["Off", "On (LUKS2, recommended)"], 1 if s.encrypt else 0)
+                if j is not None: s.encrypt = (j == 1)
+            elif i == 7:
+                j = self.menu("Bootloader", BOOTLOADERS, BOOTLOADERS.index(s.bootloader))
+                if j is not None: s.bootloader = BOOTLOADERS[j]
+            elif i == 8:
+                self.install_flow()
+
+    def install_flow(self):
+        s = self.state
+        if not s.disk:
+            self.message("Missing disk", "Choose a disk first.", curses.color_pair(3))
+            return
+        summary = [
+            "FIELD          │ VALUE",
+            "───────────────┼────────────────────────────",
+            f"Disk           │ {s.disk}",
+            f"Install mode   │ {'Erase disk' if s.install_mode == 'erase' else 'Dual boot · free space'}",
+            f"Hostname       │ {s.hostname}",
+            f"Username       │ {s.username}",
+            f"Timezone       │ {s.timezone}",
+            f"Filesystem     │ {s.filesystem}",
+            f"Encryption     │ {'LUKS2' if s.encrypt else 'Off'}",
+            f"Bootloader     │ {s.bootloader}",
+        ]
+        review = self.menu("Does this look right?", ["Yes, install", "No, change settings"], body=summary)
+        if review != 0:
+            return
+        if s.install_mode == "erase":
+            warning = [
+                f"FluxLinux will ERASE ALL DATA on {s.disk}.",
+                "This is intended for a spare disk or virtual machine.",
+            ]
+            word = "ERASE"
+        else:
+            warning = [
+                "Existing partitions will be preserved.",
+                "FluxLinux will use the largest unallocated region.",
+                "At least 17 GiB of unallocated GPT space is required.",
+                "Back up important data before changing partitions.",
+            ]
+            word = "INSTALL"
+        warning.append("The installer is UEFI-only in this release.")
+        self.message("DATA LOSS WARNING", warning, curses.color_pair(4) | curses.A_BOLD)
+        confirm = self.text_input(f"Type {word} to continue")
+        if confirm != word:
+            self.message("Cancelled", "Nothing was changed.")
+            return
+        password = self.text_input(f"Password for {s.username}", secret=True)
+        if not password:
+            self.message("Cancelled", "A non-empty user password is required.")
+            return
+        password2 = self.text_input("Confirm password", secret=True)
+        if password != password2:
+            self.message("Password mismatch", "Passwords did not match.", curses.color_pair(4))
+            return
+
+        luks_passphrase = None
+        if s.encrypt:
+            luks_passphrase = self.text_input("LUKS encryption passphrase", secret=True)
+            if not luks_passphrase:
+                self.message("Cancelled", "A non-empty LUKS passphrase is required.")
+                return
+            luks_passphrase2 = self.text_input("Confirm LUKS passphrase", secret=True)
+            if luks_passphrase != luks_passphrase2:
+                self.message("Passphrase mismatch", "Passphrases did not match.", curses.color_pair(4))
+                return
+
+        # Drop curses while the core installer streams logs to the console.
+        curses.def_prog_mode()
+        curses.endwin()
+        cmd = [
+            "/usr/local/bin/flux-install-core",
+            "--disk", s.disk,
+            "--mode", s.install_mode,
+            "--hostname", s.hostname,
+            "--username", s.username,
+            "--timezone", s.timezone,
+            "--filesystem", s.filesystem,
+            "--encrypt", "yes" if s.encrypt else "no",
+            "--bootloader", s.bootloader,
+        ]
+        env = os.environ.copy()
+        env["FLUX_PASSWORD"] = password
+        if luks_passphrase:
+            env["FLUX_LUKS_PASSPHRASE"] = luks_passphrase
+        print("\nStarting FluxLinux installation...\n")
+        started = time.monotonic()
+        rc = subprocess.call(cmd, env=env)
+        elapsed = int(time.monotonic() - started)
+        input("\nPress Enter to return to the installer...")
+        curses.reset_prog_mode()
+        curses.curs_set(0)
+        self.s.refresh()
+        if rc == 0:
+            minutes, seconds = divmod(elapsed, 60)
+            choice = self.menu(
+                "Installation complete",
+                ["Reboot now", "Return to menu"],
+                body=(f"Installed in {minutes}m {seconds:02d}s", "Remove the USB installer before rebooting."),
+            )
+            if choice == 0:
+                subprocess.call(["reboot"])
+        else:
+            self.message("Installation failed", "Review the log above, then try again.", curses.color_pair(4))
+
+    def run(self):
+        self.splash()
+        if not os.path.exists("/sys/firmware/efi"):
+            self.message("UEFI required", [
+                "FluxLinux 0.1 currently installs in UEFI mode only.",
+                "Reboot the installation media using its UEFI entry.",
+            ], curses.color_pair(3))
+        self.configure()
+
+
+def main():
+    if os.geteuid() != 0:
+        print("flux-install must run as root", file=sys.stderr)
+        return 1
+    try:
+        curses.wrapper(lambda s: UI(s).run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

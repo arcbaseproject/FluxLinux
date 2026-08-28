@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Shows live Hyprland bindings in a searchable Fuzzel list.
+set -u
+
+modmask_to_text() {
+  case "$1" in
+    0) printf '' ;;
+    1) printf 'SHIFT' ;;
+    4) printf 'CTRL' ;;
+    5) printf 'SHIFT CTRL' ;;
+    8) printf 'ALT' ;;
+    64) printf 'SUPER' ;;
+    65) printf 'SUPER SHIFT' ;;
+    68) printf 'SUPER CTRL' ;;
+    72) printf 'SUPER ALT' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+hyprctl binds -j | jq -r '.[] | select(.description != "") | [.modmask, (if .mouse then "mouse:" + .key else .key end), .description] | @tsv' |
+  while IFS=$'\t' read -r modmask key description; do
+    mods=$(modmask_to_text "$modmask")
+    combo=$([[ -n $mods ]] && echo "$mods + $key" || echo "$key")
+    printf "%-34s  → %s\n" "$combo" "$description"
+  done |
+  fuzzel --dmenu --prompt "" --placeholder "Keybindings…" --width 70 --lines 9 --line-height 40 >/dev/null

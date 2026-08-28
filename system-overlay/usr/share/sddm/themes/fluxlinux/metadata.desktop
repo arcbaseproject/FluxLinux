@@ -1,0 +1,10 @@
+[SddmGreeterTheme]
+Name=FluxLinux
+Description=Default FluxLinux login theme
+Author=FluxLinux
+Copyright=2026, FluxLinux
+License=MIT
+Type=sddm-theme
+Version=1.0
+MainScript=Main.qml
+ConfigFile=theme.conf

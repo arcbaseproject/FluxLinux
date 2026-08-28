@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+fallback='{"text":"--°","tooltip":"Weather unavailable"}'
+data=$(curl -fsS --max-time 10 'https://wttr.in/?format=j1' 2>/dev/null) || { printf '%s\n' "$fallback"; exit 0; }
+
+output=$(jq -c '
+  def icon:
+    ascii_downcase |
+    if test("thunder") then "⛈"
+    elif test("snow|sleet|blizzard|ice") then "❄"
+    elif test("rain|drizzle|shower") then "🌧"
+    elif test("fog|mist") then "🌫"
+    elif test("cloud|overcast") then "☁"
+    elif test("sunny|clear") then "☀"
+    else "◌" end;
+
+  .current_condition[0] as $current |
+  .nearest_area[0].areaName[0].value as $place |
+  ($current.weatherDesc[0].value // "Weather") as $condition |
+  (.weather[0:3] | map(
+    . as $day |
+    ($day.hourly[4] // $day.hourly[0]) as $noon |
+    (($noon.weatherDesc[0].value // "Weather") | icon) as $icon |
+    (($day.date | strptime("%Y-%m-%d") | mktime | strftime("%a")) | ascii_upcase) as $name |
+    "\($icon) \($name)  \($day.maxtempC)°/\($day.mintempC)°"
+  ) | join("    ")) as $forecast |
+  {
+    text: "\($condition | icon) \($current.temp_C)°",
+    tooltip: (
+      "<b><big>\($condition | @html)  \($current.temp_C)°C</big></b>    <b>📍 \($place | ascii_upcase | @html)</b>\n\n" +
+      "<b>FEELS</b>  \($current.FeelsLikeC)°C     <b>WIND</b>  \($current.winddir16Point) \($current.windspeedKmph) km/h     <b>HUMID</b>  \($current.humidity)%\n" +
+      "────────────────────────────────\n" + $forecast
+    )
+  }
+' <<< "$data" 2>/dev/null) || output=$fallback
+
+printf '%s\n' "$output"

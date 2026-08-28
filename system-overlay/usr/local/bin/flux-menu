@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -u
+
+route="${1:-root}"
+declare -A app_ids=()
+
+pick() {
+  local prompt="$1"
+  shift
+  printf '%s\n' "$@" | fuzzel --dmenu --prompt "$prompt"
+}
+
+pick_root() {
+  local file name id
+  local items=(
+    "󰀻 Apps                    ›" "󰧑 Learn                   ›"
+    "󱓞 Trigger                 ›" " Style                   ›"
+    " Setup                   ›" "󰉉 Install                 ›"
+    "󰭌 Remove                  ›" " Update" " About"
+    " System                  ›"
+  )
+
+  for dir in "$HOME/.local/share/applications" /usr/share/applications; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r file; do
+      grep -qE '^(NoDisplay|Hidden)=true$' "$file" && continue
+      name=$(awk -F= '$1 == "Name" { sub(/^Name=/, ""); print; exit }' "$file")
+      [[ -n "$name" && -z "${app_ids[$name]:-}" ]] || continue
+      id=$(basename "$file" .desktop)
+      app_ids["$name"]="$id"
+      items+=("$name")
+    done < <(find "$dir" -maxdepth 1 -type f -name '*.desktop' -print)
+  done
+
+  choice=$(printf '%s\n' "${items[@]}" | fuzzel --dmenu --prompt "" --placeholder "Go…")
+}
+
+while true; do
+  case "$route" in
+    root|go|menu)
+      pick_root
+      case "$choice" in
+        *Apps*) route=apps ;;
+        *Learn*) route=learn ;;
+        *Trigger*) route=trigger ;;
+        *Style*) route=style ;;
+        *Setup*) route=setup ;;
+        *Install*) route=install ;;
+        *Remove*) route=remove ;;
+        *Update*) route=update ;;
+        *About*) route=about ;;
+        *System*) route=system ;;
+        *)
+          [[ -n "${app_ids[$choice]:-}" ]] && exec gtk-launch "${app_ids[$choice]}"
+          exit 0
+          ;;
+      esac
+      ;;
+
+    apps|app|applications)
+      exec fuzzel --prompt "" --placeholder "Apps…"
+      ;;
+
+    learn)
+      choice=$(pick "Learn… " " Keybindings" " FluxLinux" " Hyprland" "󰣇 Arch" "‹ Back")
+      case "$choice" in
+        *Keybindings*) exec flux-keybindings ;;
+        *FluxLinux*) exec firefox "https://github.com/arcbaseproject/FluxLinux" ;;
+        *Hyprland*) exec firefox "https://wiki.hypr.land/" ;;
+        *Arch*) exec firefox "https://wiki.archlinux.org/" ;;
+        *Back*) route=root ;;
+        *) exit 0 ;;
+      esac
+      ;;
+
+    trigger|capture)
+      choice=$(pick "Trigger… " " Emoji" " Clipboard" " Screenshot" "󰔎 Nightlight" "‹ Back")
+      case "$choice" in
+        *Emoji*) exec flux-emoji-menu ;;
+        *Clipboard*) exec flux-clipboard-menu ;;
+        *Screenshot*)
+          exec bash -lc 'mkdir -p "$HOME/Pictures/Screenshots"; f="$HOME/Pictures/Screenshots/$(date +%Y-%m-%d_%H-%M-%S).png"; grim -g "$(slurp)" "$f" && wl-copy < "$f"'
+          ;;
+        *Nightlight*) exec flux-toggle-nightlight ;;
+        *Back*) route=root ;;
+        *) exit 0 ;;
+      esac
+      ;;
+
+    style)
+      choice=$(pick "Style… " "󰸌 Theme" " Background" "‹ Back")
+      case "$choice" in
+        *Theme*) exec flux-theme-menu ;;
+        *Background*) exec flux-background-menu ;;
+        *Back*) route=root ;;
+        *) exit 0 ;;
+      esac
+      ;;
+
+    setup|settings)
+      choice=$(pick "Setup… " "󰛳 Network" "󰕾 Audio" "󰂯 Bluetooth" "‹ Back")
+      case "$choice" in
+        *Network*) exec kitty --title "Network" -e nmtui ;;
+        *Audio*) exec pavucontrol ;;
+        *Bluetooth*) exec blueman-manager ;;
+        *Back*) route=root ;;
+        *) exit 0 ;;
+      esac
+      ;;
+
+    install)
+      exec flux-app-menu Install
+      ;;
+
+    remove|uninstall)
+      exec flux-app-menu Remove
+      ;;
+
+    update)
+      exec kitty --class flux-overlay -e flux-overlay flux-update
+      ;;
+
+    about)
+      exec kitty --class flux-overlay --title "About FluxLinux" -e flux-overlay fastfetch
+      ;;
+
+    system|power|power-menu)
+      choice=$(pick "System… " " Lock" "󰤄 Suspend" "󰍃 Logout" "󰜉 Reboot" "󰐥 Shutdown" "‹ Back")
+      case "$choice" in
+        *Lock*) exec hyprlock ;;
+        *Suspend*) exec systemctl suspend ;;
+        *Logout*) exec hyprctl dispatch exit ;;
+        *Reboot*) exec systemctl reboot ;;
+        *Shutdown*) exec systemctl poweroff ;;
+        *Back*) route=root ;;
+        *) exit 0 ;;
+      esac
+      ;;
+
+    *)
+      printf 'Unknown Flux menu route: %s\n' "$route" >&2
+      exit 2
+      ;;
+  esac
+done

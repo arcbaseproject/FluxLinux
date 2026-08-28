@@ -1,0 +1,18 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 32,
+  "spacing": 8,
+  "modules-left": ["image#launcher", "hyprland/workspaces", "hyprland/window"],
+  "modules-center": ["clock", "custom/weather"],
+  "modules-right": ["idle_inhibitor", "pulseaudio", "network", "battery", "tray"],
+  "image#launcher": {"path": "/usr/share/fluxlinux/themes/bar_icon.svg", "size": 20, "interval": "once", "on-click": "flux-menu", "tooltip": true},
+  "hyprland/workspaces": {"persistent-workspaces": {"*": 5}},
+  "hyprland/window": {"format": "{}", "max-length": 40, "separate-outputs": true},
+  "clock": {"format": "{:%a %I:%M %p}", "tooltip-format": "<big>{:%B %Y}</big>\n{calendar}", "on-click": "flux-calendar-popup"},
+  "custom/weather": {"exec": "flux-weather", "return-type": "json", "interval": 1800, "signal": 8, "on-click": "flux-weather-popup", "tooltip": false},
+  "idle_inhibitor": {"format": "{icon}", "format-icons": {"activated": "󰅶", "deactivated": "󰾪"}},
+  "network": {"format-wifi": "󰤨  {signalStrength}%", "format-ethernet": "󰈀", "format-disconnected": "󰤭", "on-click": "flux-network-popup", "on-click-right": "kitty --title Network -e nmtui"},
+  "pulseaudio": {"format": "󰕾  {volume}%", "format-muted": "󰖁", "scroll-step": 5, "on-click": "pavucontrol", "on-click-right": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"},
+  "battery": {"format": "{capacity}% {icon}", "format-icons": ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"]}
+}

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -u
+fail=0
+check() {
+  local name="$1"; shift
+  if "$@" >/dev/null 2>&1; then printf '[OK]   %s\n' "$name"; else printf '[WARN] %s\n' "$name"; fail=1; fi
+}
+check 'NetworkManager active' systemctl is-active NetworkManager
+check 'SDDM enabled' systemctl is-enabled sddm
+check 'Hyprland installed' command -v Hyprland
+check 'Waybar installed' command -v waybar
+check 'PipeWire installed' command -v pipewire
+check 'xdg-desktop-portal-hyprland installed' pacman -Q xdg-desktop-portal-hyprland
+exit "$fail"

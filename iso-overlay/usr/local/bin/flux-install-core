@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DISK=""
+MODE="erase"
+HOSTNAME="flux"
+USERNAME="flux"
+TIMEZONE="UTC"
+FILESYSTEM="btrfs"
+ENCRYPT="no"
+BOOTLOADER="systemd-boot"
+MNT="/mnt"
+
+usage() {
+  echo "Usage: flux-install-core --disk /dev/XXX --hostname NAME --username NAME --timezone ZONE \\"
+  echo "         --mode erase|alongside --filesystem btrfs|ext4 --encrypt yes|no \\"
+  echo "         --bootloader systemd-boot|grub|limine"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --disk) DISK="$2"; shift 2 ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --hostname) HOSTNAME="$2"; shift 2 ;;
+    --username) USERNAME="$2"; shift 2 ;;
+    --timezone) TIMEZONE="$2"; shift 2 ;;
+    --filesystem) FILESYSTEM="$2"; shift 2 ;;
+    --encrypt) ENCRYPT="$2"; shift 2 ;;
+    --bootloader) BOOTLOADER="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Must run as root" >&2; exit 1; }
+[[ -b "$DISK" ]] || { echo "Not a block device: $DISK" >&2; exit 1; }
+[[ -d /sys/firmware/efi ]] || { echo "UEFI boot is required" >&2; exit 1; }
+[[ "$MODE" == erase || "$MODE" == alongside ]] || { echo "Invalid install mode" >&2; exit 1; }
+[[ "$FILESYSTEM" == btrfs || "$FILESYSTEM" == ext4 ]] || { echo "Invalid filesystem" >&2; exit 1; }
+[[ "$ENCRYPT" == yes || "$ENCRYPT" == no ]] || { echo "Invalid --encrypt value" >&2; exit 1; }
+[[ "$BOOTLOADER" == systemd-boot || "$BOOTLOADER" == grub || "$BOOTLOADER" == limine ]] || { echo "Invalid --bootloader value" >&2; exit 1; }
+[[ -n "${FLUX_PASSWORD:-}" ]] || { echo "FLUX_PASSWORD is required" >&2; exit 1; }
+[[ "$ENCRYPT" == no || -n "${FLUX_LUKS_PASSPHRASE:-}" ]] || { echo "FLUX_LUKS_PASSPHRASE is required when --encrypt yes" >&2; exit 1; }
+[[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || { echo "Invalid timezone: $TIMEZONE" >&2; exit 1; }
+
+REQUIRED_CMDS=(sgdisk wipefs partprobe udevadm mkfs.fat pacstrap genfstab arch-chroot)
+[[ "$MODE" == alongside ]] && REQUIRED_CMDS+=(blockdev)
+[[ "$ENCRYPT" == yes ]] && REQUIRED_CMDS+=(cryptsetup)
+[[ "$BOOTLOADER" == grub ]] && REQUIRED_CMDS+=(grub-install grub-mkconfig)
+[[ "$BOOTLOADER" == limine ]] && REQUIRED_CMDS+=(efibootmgr)
+for cmd in "${REQUIRED_CMDS[@]}"; do
+  command -v "$cmd" >/dev/null || { echo "Missing required command: $cmd" >&2; exit 1; }
+done
+
+part() {
+  local d="$1" n="$2"
+  if [[ "$d" =~ [0-9]$ ]]; then printf '%sp%s' "$d" "$n"; else printf '%s%s' "$d" "$n"; fi
+}
+EFI=""
+ROOT=""
+ROOTDEV=""
+MNT="/mnt"
+mkdir -p "$MNT"
+
+cleanup() {
+  set +e
+  swapoff -a 2>/dev/null || true
+  umount -R "$MNT" 2>/dev/null || true
+  [[ "$ENCRYPT" == yes ]] && cryptsetup close cryptroot 2>/dev/null || true
+}
+# `cleanup` sets +e as its first line, and set -e/+e is a shell-global (not
+# per-function) setting — so if `cleanup` alone were the trap handler, the
+# very first failure would silently disable errexit for the rest of the
+# script instead of stopping it. Force an explicit exit after cleaning up.
+fail() {
+  local rc=$?
+  cleanup
+  exit "$rc"
+}
+trap fail ERR INT TERM
+
+printf '\n==> FluxLinux installer core\n'
+printf '    Disk:       %s\n    Mode:       %s\n    User:       %s\n    Host:       %s\n    FS:         %s\n    Encrypt:    %s\n    Bootloader: %s\n\n' \
+  "$DISK" "$MODE" "$USERNAME" "$HOSTNAME" "$FILESYSTEM" "$ENCRYPT" "$BOOTLOADER"
+
+if [[ "$MODE" == erase ]]; then
+  echo "==> Unmounting anything currently mounted from $DISK"
+  while read -r dev mountpoint; do
+    [[ -n "$mountpoint" ]] && umount -R "$mountpoint" || true
+  done < <(lsblk -nrpo NAME,MOUNTPOINT "$DISK" | tail -n +2)
+  [[ "$ENCRYPT" == yes ]] && cryptsetup close cryptroot 2>/dev/null || true
+
+  echo "==> Wiping partition table"
+  wipefs -af "$DISK"
+  sgdisk --zap-all "$DISK"
+  sgdisk -n 1:0:+1GiB -t 1:ef00 -c 1:FLUX_EFI "$DISK"
+  sgdisk -n 2:0:0     -t 2:8300 -c 2:FLUX_ROOT "$DISK"
+  EFI="$(part "$DISK" 1)"
+  ROOT="$(part "$DISK" 2)"
+else
+  [[ "$(lsblk -dnro PTTYPE "$DISK")" == gpt ]] || { echo "Dual boot requires an existing GPT partition table" >&2; exit 1; }
+  sgdisk -v "$DISK" >/dev/null || { echo "Existing GPT partition table failed validation" >&2; exit 1; }
+  ! lsblk -nrpo PARTLABEL "$DISK" | grep -qxE 'FLUX_(EFI|ROOT)' || { echo "FluxLinux partitions already exist on $DISK" >&2; exit 1; }
+
+  free_start="$(sgdisk -F "$DISK")"
+  free_end="$(sgdisk -E "$DISK")"
+  sector_size="$(blockdev --getss "$DISK")"
+  [[ "$free_start" =~ ^[0-9]+$ && "$free_end" =~ ^[0-9]+$ && "$sector_size" =~ ^[0-9]+$ ]] || { echo "Could not inspect unallocated space" >&2; exit 1; }
+  efi_sectors=$((1024 * 1024 * 1024 / sector_size))
+  min_root_sectors=$((16 * 1024 * 1024 * 1024 / sector_size))
+  ((free_end - free_start + 1 >= efi_sectors + min_root_sectors)) || { echo "Dual boot requires at least 17 GiB in one unallocated region" >&2; exit 1; }
+  efi_end=$((free_start + efi_sectors - 1))
+  root_start=$((efi_end + 1))
+
+  echo "==> Creating FluxLinux partitions in unallocated space"
+  sgdisk \
+    -n 0:"$free_start":"$efi_end" -t 0:ef00 -c 0:FLUX_EFI \
+    -n 0:"$root_start":"$free_end" -t 0:8300 -c 0:FLUX_ROOT "$DISK"
+fi
+partprobe "$DISK"
+udevadm settle
+
+if [[ "$MODE" == alongside ]]; then
+  EFI="$(lsblk -nrpo PATH,START "$DISK" | awk -v start="$free_start" '$2 == start { print $1; exit }')"
+  ROOT="$(lsblk -nrpo PATH,START "$DISK" | awk -v start="$root_start" '$2 == start { print $1; exit }')"
+fi
+
+[[ -b "$EFI" && -b "$ROOT" ]] || { echo "Partitions did not appear" >&2; exit 1; }
+ROOTDEV="$ROOT"
+wipefs -af "$EFI" "$ROOT"
+
+echo "==> Formatting EFI partition"
+mkfs.fat -F 32 -n FLUX_EFI "$EFI"
+
+LUKS_UUID=""
+if [[ "$ENCRYPT" == yes ]]; then
+  echo "==> Encrypting root partition (LUKS2)"
+  printf '%s' "$FLUX_LUKS_PASSPHRASE" | cryptsetup luksFormat --batch-mode --type luks2 "$ROOT" -
+  printf '%s' "$FLUX_LUKS_PASSPHRASE" | cryptsetup open "$ROOT" cryptroot -
+  ROOTDEV="/dev/mapper/cryptroot"
+  LUKS_UUID="$(blkid -s UUID -o value "$ROOT")"
+fi
+
+if [[ "$FILESYSTEM" == btrfs ]]; then
+  command -v mkfs.btrfs >/dev/null || { echo "mkfs.btrfs missing" >&2; exit 1; }
+  echo "==> Formatting Btrfs root"
+  mkfs.btrfs -f -L FLUX_ROOT "$ROOTDEV"
+  mount "$ROOTDEV" "$MNT"
+  btrfs subvolume create "$MNT/@"
+  btrfs subvolume create "$MNT/@home"
+  btrfs subvolume create "$MNT/@var_log"
+  umount "$MNT"
+  mount -o noatime,compress=zstd,subvol=@ "$ROOTDEV" "$MNT"
+  mkdir -p "$MNT/home" "$MNT/var/log" "$MNT/boot"
+  mount -o noatime,compress=zstd,subvol=@home "$ROOTDEV" "$MNT/home"
+  mount -o noatime,compress=zstd,subvol=@var_log "$ROOTDEV" "$MNT/var/log"
+else
+  echo "==> Formatting ext4 root"
+  mkfs.ext4 -F -L FLUX_ROOT "$ROOTDEV"
+  mount "$ROOTDEV" "$MNT"
+  mkdir -p "$MNT/boot"
+fi
+mount "$EFI" "$MNT/boot"
+
+mapfile -t TARGET_PACKAGES < <(grep -Ev '^\s*(#|$)' /usr/share/fluxlinux/packages.target)
+# CPU microcode package is selected at install time.
+if grep -qi GenuineIntel /proc/cpuinfo; then TARGET_PACKAGES+=(intel-ucode); fi
+if grep -qi AuthenticAMD /proc/cpuinfo; then TARGET_PACKAGES+=(amd-ucode); fi
+
+# packages.target already ships mesa + vulkan-intel/radeon/nouveau unconditionally
+# (cheap, no build step, harmless if unused). The proprietary Nvidia driver is the
+# one exception: nvidia-open-dkms compiles a kernel module via DKMS on every
+# install, so it's only worth paying that cost when Nvidia hardware is present.
+# ponytail: nvidia-open-dkms only supports Turing (2018+) and newer; pre-Turing
+# cards need the legacy nvidia-dkms package instead, installed manually post-install.
+if grep -q 0x10de /sys/class/drm/card*/device/vendor 2>/dev/null; then
+  TARGET_PACKAGES+=(nvidia-open-dkms nvidia-utils)
+fi
+
+echo "==> Installing base system and FluxLinux desktop"
+pacstrap -K "$MNT" "${TARGET_PACKAGES[@]}"
+
+echo "==> Applying FluxLinux system overlay"
+cp -a /usr/share/fluxlinux/system-overlay/. "$MNT/"
+mkdir -p "$MNT/usr/share/fluxlinux/themes"
+cp -a /usr/share/fluxlinux/themes/. "$MNT/usr/share/fluxlinux/themes/"
+# build.sh's profiledef.sh permission whitelist only reaches flux-install and
+# flux-install-core themselves (the live ISO's own top-level /usr/local/bin).
+# Everything under system-overlay/usr/local/bin only lands at this top-level
+# path just now, via the cp -a above, so its executable bit depends purely on
+# git/rsync/cp preserving it correctly end to end. Stop relying on that chain
+# and just enforce it here, once, at the one point the final path is known.
+chmod 0755 "$MNT"/usr/local/bin/*
+
+echo "==> Generating fstab"
+genfstab -U "$MNT" > "$MNT/etc/fstab"
+
+echo "==> Configuring locale, timezone, hostname and user"
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MNT/etc/localtime"
+arch-chroot "$MNT" hwclock --systohc
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' "$MNT/etc/locale.gen"
+arch-chroot "$MNT" locale-gen
+printf 'LANG=en_US.UTF-8\n' > "$MNT/etc/locale.conf"
+printf '%s\n' "$HOSTNAME" > "$MNT/etc/hostname"
+cat > "$MNT/etc/hosts" <<EOF
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+EOF
+
+arch-chroot "$MNT" useradd -m -G wheel,video,audio,input,storage -s /bin/bash "$USERNAME"
+printf '%s:%s\n' "$USERNAME" "$FLUX_PASSWORD" | arch-chroot "$MNT" chpasswd
+unset FLUX_PASSWORD
+printf '%%wheel ALL=(ALL:ALL) ALL\n' > "$MNT/etc/sudoers.d/10-wheel"
+chmod 0440 "$MNT/etc/sudoers.d/10-wheel"
+
+# Give the created user the FluxLinux skel even though /etc/skel arrived after useradd.
+cp -a "$MNT/etc/skel/." "$MNT/home/$USERNAME/"
+arch-chroot "$MNT" chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+
+# Render the default theme's colors/wallpaper now, so first boot isn't relying
+# on the skel defaults alone. Cosmetic only — never fail the install over it.
+arch-chroot "$MNT" runuser -u "$USERNAME" -- flux-theme-set mint || true
+
+if [[ "$ENCRYPT" == yes ]]; then
+  echo "==> Wiring the encrypt hook into the initramfs"
+  sed -i '0,/ filesystems/{s/ filesystems/ encrypt filesystems/}' "$MNT/etc/mkinitcpio.conf"
+  arch-chroot "$MNT" mkinitcpio -P
+  unset FLUX_LUKS_PASSPHRASE
+fi
+
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT")"
+MICROCODE_IMG=""
+if [[ -f "$MNT/boot/intel-ucode.img" ]]; then MICROCODE_IMG="intel-ucode.img"; fi
+if [[ -f "$MNT/boot/amd-ucode.img" ]]; then MICROCODE_IMG="amd-ucode.img"; fi
+ROOTFLAGS=""
+[[ "$FILESYSTEM" == btrfs ]] && ROOTFLAGS=" rootflags=subvol=@"
+if [[ "$ENCRYPT" == yes ]]; then
+  ROOT_PARAM="cryptdevice=UUID=${LUKS_UUID}:cryptroot root=/dev/mapper/cryptroot"
+else
+  ROOT_PARAM="root=UUID=${ROOT_UUID}"
+fi
+# Quiet boot: suppress kernel/init log spam and the blinking VT cursor between
+# the bootloader handing off and the login screen appearing.
+QUIET_CMDLINE="quiet loglevel=3 systemd.show_status=false vt.global_cursor_default=0"
+KERNEL_CMDLINE="${ROOT_PARAM} rw${ROOTFLAGS} ${QUIET_CMDLINE}"
+
+# Bootloader branding is derived from the "mint" theme (the install-time
+# default from /usr/share/fluxlinux/themes) so it isn't a second, drifting
+# copy of the same brand colors. See flux-theme-set for the live desktop side.
+# shellcheck source=/dev/null
+source "$MNT/usr/share/fluxlinux/themes/mint/colors.sh"
+
+install_bootloader_systemd_boot() {
+  echo "==> Installing systemd-boot"
+  arch-chroot -S "$MNT" bootctl install
+  cat > "$MNT/boot/loader/loader.conf" <<EOF
+default  fluxlinux.conf
+timeout  3
+console-mode max
+editor   no
+EOF
+  local microcode_line=""
+  [[ -n "$MICROCODE_IMG" ]] && microcode_line="initrd  /${MICROCODE_IMG}"
+  cat > "$MNT/boot/loader/entries/fluxlinux.conf" <<EOF
+title   FluxLinux
+linux   /vmlinuz-linux
+${microcode_line}
+initrd  /initramfs-linux.img
+options ${KERNEL_CMDLINE}
+EOF
+}
+
+install_bootloader_grub() {
+  echo "==> Installing GRUB"
+  arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=FluxLinux
+  local grub_cmdline=""
+  [[ "$ENCRYPT" == yes ]] && grub_cmdline="cryptdevice=UUID=${LUKS_UUID}:cryptroot"
+  cat > "$MNT/etc/default/grub" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_TIMEOUT_STYLE=menu
+GRUB_DISTRIBUTOR="FluxLinux"
+# Quiet on the default entry only, so the recovery/advanced entries still
+# show full boot messages for debugging.
+GRUB_CMDLINE_LINUX_DEFAULT="${QUIET_CMDLINE}"
+GRUB_CMDLINE_LINUX="${grub_cmdline}"
+GRUB_TERMINAL_OUTPUT=gfxterm
+GRUB_GFXMODE=auto
+GRUB_GFXPAYLOAD_LINUX=keep
+GRUB_DISABLE_OS_PROBER=true
+GRUB_COLOR_NORMAL="light-cyan/black"
+GRUB_COLOR_HIGHLIGHT="black/light-cyan"
+EOF
+  # /boot is always a plain, unencrypted ESP in this layout (only / may be
+  # LUKS), so GRUB itself never needs to decrypt anything: GRUB_CMDLINE_LINUX
+  # above is what hands cryptdevice= to the kernel/initramfs. Deliberately
+  # not setting GRUB_ENABLE_CRYPTODISK, which is for an encrypted /boot and
+  # would make grub-mkconfig auto-inject its own (possibly differently
+  # named) cryptdevice= alongside ours.
+  arch-chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+}
+
+install_bootloader_limine() {
+  echo "==> Installing Limine"
+  mkdir -p "$MNT/boot/EFI/BOOT"
+  cp "$MNT/usr/share/limine/BOOTX64.EFI" "$MNT/boot/EFI/BOOT/BOOTX64.EFI"
+  # Unlike bootctl/grub-install, dropping the binary at the ESP's fallback
+  # path isn't enough on its own — some firmware won't try it without an
+  # explicit NVRAM entry, and lands in the UEFI shell instead of booting.
+  local efi_partnum
+  efi_partnum="$(lsblk -dnro PARTN "$EFI")"
+  efibootmgr --create --disk "$DISK" --part "$efi_partnum" \
+    --loader '\EFI\BOOT\BOOTX64.EFI' --label "FluxLinux" >/dev/null
+  {
+    echo "timeout: 3"
+    echo "default_entry: 1"
+    echo "interface_branding: FluxLinux Bootloader"
+    echo "interface_branding_color: ${ACCENT}"
+    echo "interface_help_color: ${ACCENT}"
+    echo "interface_help_color_bright: ${ACCENT}"
+    echo "hash_mismatch_panic: no"
+    echo
+    echo "term_background: ${BG}"
+    echo "backdrop: ${BG}"
+    echo "term_foreground: ${FG}"
+    echo "term_background_bright: ${SURFACE}"
+    echo "term_palette: ${BG};e06c75;${ACCENT};e5c07b;61afef;c678dd;${ACCENT};${MUTED}"
+    echo "term_palette_bright: ${SURFACE};e06c75;${ACCENT};e5c07b;61afef;c678dd;${ACCENT};${FG}"
+    echo
+    echo "/FluxLinux"
+    echo "    protocol: linux"
+    echo "    path: boot():/vmlinuz-linux"
+    [[ -n "$MICROCODE_IMG" ]] && echo "    module_path: boot():/${MICROCODE_IMG}"
+    echo "    module_path: boot():/initramfs-linux.img"
+    echo "    cmdline: ${KERNEL_CMDLINE}"
+  } > "$MNT/boot/EFI/BOOT/limine.conf"
+}
+
+case "$BOOTLOADER" in
+  systemd-boot) install_bootloader_systemd_boot ;;
+  grub) install_bootloader_grub ;;
+  limine) install_bootloader_limine ;;
+esac
+
+echo "==> Enabling services"
+arch-chroot "$MNT" systemctl enable NetworkManager.service
+arch-chroot "$MNT" systemctl enable bluetooth.service
+arch-chroot "$MNT" systemctl enable sddm.service
+arch-chroot "$MNT" systemctl enable systemd-timesyncd.service
+
+# Avoid a stale live-media machine-id.
+: > "$MNT/etc/machine-id"
+rm -f "$MNT/var/lib/dbus/machine-id"
+
+sync
+trap - ERR INT TERM
+cleanup
+
+echo
+echo "=================================================="
+echo " FluxLinux installation complete."
+echo " Remove the installation media and reboot."
+echo "=================================================="

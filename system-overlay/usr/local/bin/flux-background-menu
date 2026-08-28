@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def move(index, delta, count):
+    return max(0, min(index + delta, count - 1))
+
+
+if sys.argv[1:] == ["--self-check"]:
+    assert move(0, -1, 3) == 0
+    assert move(0, 1, 3) == 1
+    assert move(2, 1, 3) == 2
+    raise SystemExit
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gdk, GdkPixbuf, Gtk, GtkLayerShell
+
+
+def fail(message):
+    subprocess.run(["notify-send", "FluxLinux", message], check=False)
+    raise SystemExit(1)
+
+
+def backgrounds():
+    state = Path.home() / ".local/state/fluxlinux/current-theme.name"
+    try:
+        name = state.read_text().strip()
+    except OSError:
+        fail("No theme set yet")
+
+    for root in (Path.home() / ".config/fluxlinux/themes", Path("/usr/share/fluxlinux/themes")):
+        theme = root / name
+        if theme.is_dir():
+            files = sorted(path for path in theme.iterdir() if path.suffix.lower() in {".png", ".webp", ".jpg", ".jpeg"})
+            return files or fail(f"No backgrounds for {name}")
+    fail(f"Theme not found: {name}")
+
+
+def color(name, fallback):
+    theme = Path.home() / ".config/fluxlinux/theme/waybar-colors.css"
+    try:
+        match = re.search(rf"@define-color {name} #(\w{{6}});", theme.read_text())
+        value = match.group(1) if match else fallback
+    except OSError:
+        value = fallback
+    return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+class Switcher(Gtk.DrawingArea):
+    def __init__(self, window, files):
+        super().__init__()
+        self.window = window
+        self.files = files
+        self.index = 0
+        self.accent = color("accent", "8fcaa3")
+        self.pixbufs = [GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), 1000, 620, True) for path in files]
+        self.connect("draw", self.draw)
+
+    def card(self, cr, pixbuf, x, y, width, height, angle, opacity, selected=False):
+        cr.save()
+        cr.translate(x + width / 2, y + height / 2)
+        cr.rotate(angle)
+        cr.translate(-width / 2, -height / 2)
+
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.rectangle(10, 12, width, height)
+        cr.fill()
+        cr.rectangle(0, 0, width, height)
+        cr.clip()
+
+        scale = max(width / pixbuf.get_width(), height / pixbuf.get_height())
+        image_width = pixbuf.get_width() * scale
+        image_height = pixbuf.get_height() * scale
+        cr.translate((width - image_width) / 2, (height - image_height) / 2)
+        cr.scale(scale, scale)
+        Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+        cr.paint_with_alpha(opacity)
+        cr.restore()
+
+        cr.save()
+        cr.translate(x + width / 2, y + height / 2)
+        cr.rotate(angle)
+        cr.translate(-width / 2, -height / 2)
+        cr.set_source_rgb(*self.accent)
+        cr.set_line_width(3 if selected else 1)
+        cr.rectangle(1.5, 1.5, width - 3, height - 3)
+        cr.stroke()
+        cr.restore()
+
+    def draw(self, _widget, cr):
+        width = self.get_allocated_width()
+        height = self.get_allocated_height()
+        cr.set_source_rgba(0, 0, 0, 0.52)
+        cr.paint()
+
+        card_width = min(920, width * 0.72)
+        card_height = min(560, height * 0.80)
+        x = (width - card_width) / 2
+        y = (height - card_height) / 2
+        side_width = card_width * 0.66
+        side_height = card_height * 0.88
+
+        for i in range(len(self.files) - 1, self.index, -1):
+            distance = i - self.index
+            self.card(cr, self.pixbufs[i], x + card_width * (0.70 + distance * 0.08),
+                      y + (card_height - side_height) / 2, side_width, side_height, 0.07, 0.72)
+        for i in range(self.index):
+            distance = self.index - i
+            self.card(cr, self.pixbufs[i], x - side_width * (0.82 + distance * 0.12),
+                      y + (card_height - side_height) / 2, side_width, side_height, -0.07, 0.72)
+
+        self.card(cr, self.pixbufs[self.index], x, y, card_width, card_height, 0, 1, True)
+
+    def choose(self):
+        render = Path.home() / ".config/fluxlinux/theme/wallpaper.png"
+        render.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(["magick", str(self.files[self.index]), str(render)], check=True)
+        except (OSError, subprocess.CalledProcessError):
+            subprocess.run(["notify-send", "FluxLinux", "Could not apply background"], check=False)
+            return
+
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            result = subprocess.run(
+                ["hyprctl", "hyprpaper", "wallpaper", f",{render},cover"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            if result.returncode:
+                subprocess.run(["setsid", "-f", "hyprpaper"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+        self.window.destroy()
+
+    def key(self, key):
+        if key in (Gdk.KEY_Left, Gdk.KEY_Up):
+            self.index = move(self.index, -1, len(self.files))
+        elif key in (Gdk.KEY_Right, Gdk.KEY_Down):
+            self.index = move(self.index, 1, len(self.files))
+        elif key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.choose()
+            return
+        elif key == Gdk.KEY_Escape:
+            self.window.destroy()
+            return
+        else:
+            return
+        self.queue_draw()
+
+
+def activate(app):
+    if windows := app.get_windows():
+        windows[0].destroy()
+        return
+
+    files = backgrounds()
+    window = Gtk.ApplicationWindow(application=app)
+    window.set_decorated(False)
+    window.set_app_paintable(True)
+
+    visual = window.get_screen().get_rgba_visual()
+    if visual:
+        window.set_visual(visual)
+
+    GtkLayerShell.init_for_window(window)
+    GtkLayerShell.set_namespace(window, "background-switcher")
+    GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
+    for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.RIGHT, GtkLayerShell.Edge.BOTTOM, GtkLayerShell.Edge.LEFT):
+        GtkLayerShell.set_anchor(window, edge, True)
+    GtkLayerShell.set_keyboard_interactivity(window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+    switcher = Switcher(window, files)
+    window.connect("key-press-event", lambda _window, event: switcher.key(event.keyval))
+    window.add(switcher)
+    window.show_all()
+
+
+app = Gtk.Application(application_id="org.fluxlinux.BackgroundSwitcher")
+app.connect("activate", activate)
+app.run()

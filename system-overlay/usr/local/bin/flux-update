@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_URL="${REPO_URL:-https://github.com/arcbaseproject/FluxLinux.git}"
+REPO_DIR="${REPO_DIR:-/var/lib/fluxlinux/repo}"
+
+printf '==> Updating FluxLinux / Arch packages\n'
+sudo pacman -Syu
+
+printf '\n==> Syncing FluxLinux configs from %s\n' "$REPO_URL"
+if [[ -d "$REPO_DIR/.git" ]]; then
+  sudo git -C "$REPO_DIR" pull --ff-only
+else
+  sudo git clone --depth 1 "$REPO_URL" "$REPO_DIR"
+fi
+# ponytail: overwrites system-overlay files wholesale, no per-file merge/version
+# migration. Add config-version migration (README roadmap item 6) if users need
+# to keep local edits to shipped dotfiles across releases.
+sudo rsync -a "$REPO_DIR/system-overlay/" /
+
+printf '\n==> Checking failed systemd units\n'
+systemctl --failed --no-pager || true

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# List available themes and apply the chosen one immediately.
+set -euo pipefail
+
+declare -A label_to_dir=()
+list=""
+
+for base in "$HOME/.config/fluxlinux/themes" /usr/share/fluxlinux/themes; do
+  [[ -d "$base" ]] || continue
+  for theme_path in "$base"/*/; do
+    [[ -f "$theme_path/colors.sh" ]] || continue
+    dir_name=$(basename "$theme_path")
+    # shellcheck source=/dev/null
+    LABEL="" source "$theme_path/colors.sh"
+    label="${LABEL:-$dir_name}"
+    [[ -n "${label_to_dir[$label]:-}" ]] && continue
+    label_to_dir["$label"]="$dir_name"
+    list+="$label"$'\n'
+  done
+done
+
+[[ -n "$list" ]] || { notify-send "FluxLinux" "No themes found" 2>/dev/null || true; exit 1; }
+
+current=$(flux-theme-current 2>/dev/null || echo "Unknown")
+choice=$(printf '%s' "$list" | sort -u | fuzzel --dmenu --prompt "  Theme (current: ${current})> ")
+[[ -n "$choice" ]] || exit 0
+
+flux-theme-set "${label_to_dir[$choice]}"

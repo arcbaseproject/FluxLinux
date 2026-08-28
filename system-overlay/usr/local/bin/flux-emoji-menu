@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -u
+emojis='😀 grinning
+😂 joy
+😅 sweat smile
+😍 heart eyes
+😎 cool
+🤔 thinking
+😢 crying
+😡 angry
+😴 sleepy
+👍 thumbs up
+👎 thumbs down
+👏 clap
+🙏 pray
+🤝 handshake
+💪 muscle
+❤️ heart
+🔥 fire
+✨ sparkles
+🎉 party
+💯 hundred
+⚡ lightning
+⭐ star
+🚀 rocket
+💡 idea
+📌 pin
+📎 clip
+🔒 lock
+🔓 unlock
+🐛 bug
+🛠️ tools
+📦 package
+🖥️ desktop
+⌨️ keyboard
+🐧 penguin
+☕ coffee
+🍕 pizza
+🎵 music
+📷 camera
+🌙 moon
+☀️ sun
+🌧️ rain
+❄️ snow
+✅ check
+❌ cross'
+
+choice=$(printf '%s\n' "$emojis" | fuzzel --dmenu --prompt "  ")
+[ -z "$choice" ] && exit 0
+printf '%s' "${choice%% *}" | wl-copy
