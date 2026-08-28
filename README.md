@@ -1,6 +1,6 @@
 # FluxLinux
 
-FluxLinux is an Arch-based, Hyprland-first Linux distribution project inspired by the "opinionated system + installer + configs" approach used by projects such as Omarchy.
+FluxLinux is an Arch-based, Hyprland-first Linux distribution project built around an opinionated system + installer + configs approach.
 
 This repository produces a **bootable x86_64 UEFI ISO** with a custom curses TUI installer. The installer can wipe a selected disk, partition it, install an Arch base system, apply FluxLinux defaults, configure a user, install systemd-boot, and boot into a Hyprland desktop through SDDM.
 
@@ -89,7 +89,7 @@ Those limitations keep the first release understandable and testable.
 
 ## Development order
 
-A sensible path toward a polished Omarchy-style distribution is:
+A sensible path toward a polished distribution is:
 
 1. Make `./test-vm.sh` install and reboot successfully every time.
 2. Add installer logging and recovery.
